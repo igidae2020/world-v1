@@ -79,10 +79,11 @@ SEC_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
-    "Content-Security-Policy": "default-src 'self' https://js.tosspayments.com; "
+    "Content-Security-Policy": "default-src 'self' https://js.tosspayments.com https://*.tosspayments.com; "
                               "script-src 'self' https://js.tosspayments.com; "
                               "style-src 'self' 'unsafe-inline'; "
-                              "connect-src 'self'; "
+                              "connect-src 'self' https://*.tosspayments.com; "
+                              "frame-src https://*.tosspayments.com; "
                               "frame-ancestors 'none';",
 }
 
@@ -145,12 +146,6 @@ def init_db() -> None:
 
     conn.commit()
     conn.close()
-
-# ---- ensure DB initialized on import (Render safe) ----
-try:
-    init_db()
-except Exception as e:
-    print("DB init skipped:", e)
 
 def clamp(x: int, lo: int = 0, hi: int = 100) -> int:
     return max(lo, min(hi, x))
@@ -387,15 +382,19 @@ INDEX_HTML = r"""
     .row{display:flex;gap:10px;flex-wrap:wrap}
     .row button{flex:1;min-width:160px}
   </style>
+
+  <!-- Toss Payment Widget -->
   <script src="https://js.tosspayments.com/v1/payment-widget"></script>
 </head>
-<body>
+
+<!-- CSP 때문에 inline script/onclick 금지: data-*로 값 전달 -->
+<body data-client-key="{{ client_key }}" data-base-url="{{ base_url }}">
   <h1>WORLD v1</h1>
 
   <div class="card">
     <div class="row">
-      <button onclick="buy('BUFFER')">완충권 ₩19,000</button>
-      <button onclick="buy('AMP')" class="secondary">증폭권 ₩29,000</button>
+      <button id="btn-buffer" type="button">완충권 ₩19,000</button>
+      <button id="btn-amp" type="button" class="secondary">증폭권 ₩29,000</button>
     </div>
     <p><small>환불 없음. 결과 기록 영구.</small></p>
   </div>
@@ -403,38 +402,11 @@ INDEX_HTML = r"""
   <div class="card">
     <p><a href="/log/latest">/log/latest</a></p>
     <pre id="log">(loading...)</pre>
+    <pre id="debug"></pre>
   </div>
 
-<script>
-const clientKey = "{{ client_key }}";
-const baseUrl = "{{ base_url }}";
-
-async function buy(action){
-  const res = await fetch("/order/create", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({action})
-  });
-  const data = await res.json();
-  if(!data.ok){ alert("order error"); return; }
-
-  const paymentWidget = PaymentWidget(clientKey, data.customerKey);
-  paymentWidget.requestPayment({
-    orderId: data.orderId,
-    orderName: data.orderName,
-    amount: data.amount,
-    successUrl: baseUrl + "/toss/success",
-    failUrl: baseUrl + "/toss/fail"
-  });
-}
-
-async function loadLog(){
-  const r = await fetch("/log/latest", {cache:"no-store"});
-  document.getElementById("log").textContent = await r.text();
-}
-loadLog();
-</script>
-
+  <!-- CSP-safe: same-origin external script -->
+  <script src="/app.js"></script>
 </body>
 </html>
 """
@@ -447,6 +419,92 @@ def _after(resp):
 def index():
     # require BASE_URL + TOSS_CLIENT_KEY in production
     return render_template_string(INDEX_HTML, client_key=TOSS_CLIENT_KEY, base_url=BASE_URL or request.host_url.rstrip("/"))
+
+
+APP_JS = r"""
+(function(){
+  function dbg(msg){
+    try{
+      console.log(msg);
+      const el = document.getElementById("debug");
+      if(el) el.textContent += msg + "\n";
+    }catch(_){}
+  }
+
+  async function loadLog(){
+    try{
+      const r = await fetch("/log/latest", {cache:"no-store"});
+      const t = await r.text();
+      const el = document.getElementById("log");
+      if(el) el.textContent = t;
+    }catch(e){
+      dbg("[loadLog] failed: " + (e && e.message ? e.message : e));
+    }
+  }
+
+  async function buy(action){
+    dbg("[buy] clicked: " + action);
+
+    let data;
+    try{
+      dbg("[buy] calling /order/create ...");
+      const res = await fetch("/order/create", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({action})
+      });
+      dbg("[buy] /order/create status=" + res.status);
+      data = await res.json();
+      dbg("[buy] /order/create json=" + JSON.stringify(data));
+    }catch(e){
+      dbg("[buy] fetch failed: " + (e && e.message ? e.message : e));
+      alert("order/create fetch failed (see console/debug)");
+      return;
+    }
+
+    if(!data || !data.ok){
+      alert("order create failed (see debug)");
+      return;
+    }
+
+    try{
+      const clientKey = document.body.dataset.clientKey || "";
+      const baseUrl  = document.body.dataset.baseUrl || "";
+      const widgetFactory = (typeof PaymentWidget === "function") ? PaymentWidget : window.PaymentWidget;
+      if(!widgetFactory) throw new Error("PaymentWidget is not loaded");
+
+      const widget = widgetFactory(clientKey, data.customerKey);
+
+      await widget.requestPayment({
+        orderId: data.orderId,
+        orderName: data.orderName,
+        amount: data.amount,
+        successUrl: baseUrl + "/toss/success",
+        failUrl: baseUrl + "/toss/fail"
+      });
+    }catch(e){
+      dbg("[buy] payment widget error: " + (e && e.message ? e.message : e));
+      alert("payment widget error (check console/debug)");
+    }
+  }
+
+  window.addEventListener("DOMContentLoaded", function(){
+    dbg("[boot] DOMContentLoaded");
+    const b1 = document.getElementById("btn-buffer");
+    const b2 = document.getElementById("btn-amp");
+    if(b1) b1.addEventListener("click", function(){ buy("BUFFER"); });
+    if(b2) b2.addEventListener("click", function(){ buy("AMP"); });
+    dbg("[boot] handlers attached: " + !!b1 + "," + !!b2);
+    loadLog();
+  });
+})();
+"""
+
+
+@APP.get("/app.js")
+def app_js():
+    return Response(APP_JS, mimetype="application/javascript; charset=utf-8")
+
 
 @APP.get("/log/latest")
 def log_latest():
