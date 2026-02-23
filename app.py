@@ -146,6 +146,12 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
+# ---- ensure DB initialized on import (Render safe) ----
+try:
+    init_db()
+except Exception as e:
+    print("DB init skipped:", e)
+
 def clamp(x: int, lo: int = 0, hi: int = 100) -> int:
     return max(lo, min(hi, x))
 
